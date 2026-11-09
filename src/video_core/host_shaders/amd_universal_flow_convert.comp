@@ -1,0 +1,48 @@
+// SPDX-FileCopyrightText: Copyright 2026 Lichii experimental integration
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Convert official FidelityFX Optical Flow 8x8 R16G16_SINT vectors into the
+// existing RG16F motion texture consumed by Lichii's interpolation shader.
+// AMD vectors: in display pixels, previous-position = current-position + v.
+// Lichii's shader later divides the RG16F motion by its texture dimensions.
+// Thus we scale by destination-size/display-size here to preserve normalized UV.
+#version 460 core
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(binding = 0) uniform isampler2D AmdVectors;
+layout(binding = 1, rg16f) uniform writeonly image2D LichiiMotion;
+layout(binding = 2, r32ui) uniform readonly uimage2D SceneChange;
+
+layout(push_constant) uniform Params {
+    ivec2 motion_size;
+    ivec2 display_size;
+};
+
+vec2 sampleAMD(ivec2 p) {
+    ivec2 hi = textureSize(AmdVectors, 0) - 1;
+    return vec2(texelFetch(AmdVectors, clamp(p, ivec2(0), hi), 0).xy);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, motion_size))) return;
+
+    // Slot 1 is the scene-change/history-bits slot of FidelityFX SCD.
+    bool scene_cut = (imageLoad(SceneChange, ivec2(1, 0)).x & 1u) != 0u;
+    vec2 velocity = vec2(0.0);
+    if (!scene_cut) {
+        vec2 source = (vec2(pixel) + 0.5) * vec2(display_size) / vec2(motion_size);
+        // AMD stores one pixel-motion vector per 8x8 display-pixel block.
+        // Interpolate between block centres to avoid stair-step displacement.
+        vec2 block = source / 8.0 - 0.5;
+        ivec2 lo = ivec2(floor(block));
+        vec2 t = fract(block);
+        vec2 v00 = sampleAMD(lo);
+        vec2 v10 = sampleAMD(lo + ivec2(1, 0));
+        vec2 v01 = sampleAMD(lo + ivec2(0, 1));
+        vec2 v11 = sampleAMD(lo + ivec2(1, 1));
+        velocity = mix(mix(v00, v10, t.x), mix(v01, v11, t.x), t.y);
+        // Do not bend the scene across unreliable huge jumps/cuts.
+        if (dot(velocity, velocity) > (256.0 * 256.0)) velocity = vec2(0.0);
+    }
+    vec2 internal_motion = velocity * vec2(motion_size) / vec2(display_size);
+    imageStore(LichiiMotion, pixel, vec4(internal_motion, 0.0, 0.0));
+}

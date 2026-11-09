@@ -1,0 +1,144 @@
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -8,6 +8,7 @@
+ #include <atomic>
+ #include <chrono>
+ #include <cstddef>
++#include <cstdlib>
+ #include <fstream>
+ #include <functional>
+ #include <iostream>
+@@ -401,6 +402,17 @@
+     }
+     return std::min(max_core_threads, desired);
+ #else
++    // Optional diagnostic tuning: without this variable, retain official build 117 behaviour.
++    // Limit the worker count rather than silently increasing it on high-core-count hosts.
++    if (const char* const value = std::getenv("LICHII_PIPELINE_WORKERS")) {
++        char* end{};
++        const unsigned long requested = std::strtoul(value, &end, 10);
++        if (end != value && *end == '\0' && requested >= 1 && requested <= 64) {
++            return std::min(max_core_threads, static_cast<size_t>(requested));
++        }
++        LOG_WARNING(Render_Vulkan,
++                    "Ignoring invalid LICHII_PIPELINE_WORKERS value: {}", value);
++    }
+     return max_core_threads;
+ #endif
+ }
+@@ -2093,47 +2105,63 @@
+ 
+ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& filename,
+                                                  const vk::PipelineCache& pipeline_cache,
+-                                                 u32 cache_version) try {
+-    // Written beside the cache and renamed over it: the emulator stopped mid-write left the cache
+-    // empty, and every later boot failed to read it.
++                                                 u32 cache_version) {
++    // Never replace a valid disk cache with a failed or incomplete driver snapshot.
++    // The cap bounds the transient allocation made by vkGetPipelineCacheData.
++    constexpr size_t MaxDriverCacheBytes = 512ULL * 1024 * 1024;
+     auto temporary = filename;
+     temporary += ".tmp";
+-    std::ofstream file(temporary, std::ios::binary);
+-    file.exceptions(std::ifstream::failbit);
+-    if (!file.is_open()) {
+-        LOG_ERROR(Common_Filesystem, "Failed to open Vulkan driver pipeline cache file {}",
+-                  Common::FS::PathToUTF8String(filename));
+-        return;
+-    }
+-    file.write(VULKAN_CACHE_MAGIC_NUMBER.data(), VULKAN_CACHE_MAGIC_NUMBER.size())
+-        .write(reinterpret_cast<const char*>(&cache_version), sizeof(cache_version));
+-
+-    size_t cache_size = 0;
+-    std::vector<char> cache_data;
+-    if (pipeline_cache) {
+-        pipeline_cache.Read(&cache_size, nullptr);
+-        cache_data.resize(cache_size);
+-        pipeline_cache.Read(&cache_size, cache_data.data());
+-    }
+-    file.write(cache_data.data(), cache_size);
+-    file.close();
+-    std::error_code error;
+-    std::filesystem::rename(temporary, filename, error);
+-    if (error) {
+-        LOG_ERROR(Common_Filesystem, "Failed to replace Vulkan driver pipeline cache file {}: {}",
+-                  Common::FS::PathToUTF8String(filename), error.message());
++    try {
++        size_t cache_size{};
++        std::vector<char> cache_data;
++        if (pipeline_cache) {
++            const VkResult size_result = pipeline_cache.Read(&cache_size, nullptr);
++            if (size_result != VK_SUCCESS || cache_size > MaxDriverCacheBytes) {
++                LOG_WARNING(Render_Vulkan,
++                            "Skipping Vulkan cache snapshot: result {}, size {} bytes",
++                            static_cast<int>(size_result), cache_size);
++                return;
++            }
++            if (cache_size > 0) {
++                cache_data.resize(cache_size);
++                const VkResult data_result = pipeline_cache.Read(&cache_size, cache_data.data());
++                if (data_result != VK_SUCCESS || cache_size > cache_data.size()) {
++                    LOG_WARNING(Render_Vulkan,
++                                "Skipping incomplete Vulkan cache snapshot: result {}, size {}",
++                                static_cast<int>(data_result), cache_size);
++                    return;
++                }
++            }
++        }
++
++        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
++        if (!file) {
++            LOG_ERROR(Common_Filesystem, "Could not open Vulkan temporary cache {}",
++                      Common::FS::PathToUTF8String(temporary));
++            return;
++        }
++        file.exceptions(std::ios::failbit | std::ios::badbit);
++        file.write(VULKAN_CACHE_MAGIC_NUMBER.data(), VULKAN_CACHE_MAGIC_NUMBER.size())
++            .write(reinterpret_cast<const char*>(&cache_version), sizeof(cache_version));
++        if (cache_size > 0) {
++            file.write(cache_data.data(), static_cast<std::streamsize>(cache_size));
++        }
++        file.close();
++
++        std::error_code error;
++        std::filesystem::rename(temporary, filename, error);
++        if (error) {
++            LOG_ERROR(Common_Filesystem, "Failed to replace Vulkan cache {}: {}",
++                      Common::FS::PathToUTF8String(filename), error.message());
++            std::filesystem::remove(temporary, error);
++            return;
++        }
++        LOG_INFO(Render_Vulkan, "Vulkan driver pipelines cached at: {}",
++                 Common::FS::PathToUTF8String(filename));
++    } catch (const std::exception& e) {
++        LOG_ERROR(Common_Filesystem, "Vulkan cache write failed: {}", e.what());
++        std::error_code error;
+         std::filesystem::remove(temporary, error);
+-        return;
+-    }
+-
+-    LOG_INFO(Render_Vulkan, "Vulkan driver pipelines cached at: {}",
+-             Common::FS::PathToUTF8String(filename));
+-
+-} catch (const std::ios_base::failure& e) {
+-    LOG_ERROR(Common_Filesystem, "{}", e.what());
+-    if (!Common::FS::RemoveFile(filename)) {
+-        LOG_ERROR(Common_Filesystem, "Failed to delete Vulkan driver pipeline cache file {}",
+-                  Common::FS::PathToUTF8String(filename));
+     }
+ }
+ 
+@@ -2188,6 +2216,13 @@
+ 
+         static constexpr size_t header_size = magic_number.size() + sizeof(cache_version);
+         const size_t cache_size = static_cast<size_t>(end) - header_size;
++        // A malformed or unexpectedly huge file must not trigger unbounded allocation.
++        constexpr size_t MaxDriverCacheBytes = 512ULL * 1024 * 1024;
++        if (cache_size > MaxDriverCacheBytes) {
++            LOG_WARNING(Render_Vulkan,
++                        "Ignoring oversized Vulkan driver cache ({} bytes)", cache_size);
++            return create_pipeline_cache(0, nullptr);
++        }
+         std::vector<char> cache_data(cache_size);
+         file.read(cache_data.data(), cache_size);
+ 

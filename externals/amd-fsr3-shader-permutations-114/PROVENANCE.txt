@@ -1,0 +1,5 @@
+Pre-generated shader permutation headers; not maintained by AMD.
+Source: https://github.com/FireBurn/UniversalScalers-Vulkan.git
+Pinned commit: d38393c2cbaf33dce366bd4ec6927a4951cfbed2
+Original shaders/runtime: AMD FidelityFX SDK v1.1.4 (MIT).
+Checked SHA256SUMS for 200 upscaler + 164 frame generation/optical flow headers.
